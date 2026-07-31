@@ -1,0 +1,12 @@
+# Dependencias directas compatibles con la APK Android.
+# Las dependencias transitivas de requests (certifi, charset-normalizer, idna y
+# urllib3) se resuelven automáticamente; no deben duplicarse aquí.
+python3
+kivy==2.3.1
+numpy
+requests==2.32.4
+tenacity==9.1.2
+websockets==13.1
+plyer==2.1.0
+
+# No añadir python-dotenv, pandas, matplotlib, scipy, torch, tensorflow ni ccxt.
