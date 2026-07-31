@@ -1,4 +1,4 @@
-name: AEON V9.2.0 Android Production APK
+name: AEON V9.2 Professional - Compilar APK
 
 on:
   workflow_dispatch:
@@ -14,116 +14,617 @@ on:
       - "**/*.jpg"
       - "**/*.jpeg"
       - "**/*.ttf"
-      - "buildozer.spec"
-      - "requirements-android.txt"
+      - "**/buildozer.spec"
+      - "**/requirements-android.txt"
       - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: aeon-android-${{ github.ref }}
-  cancel-in-progress: true
+  group: aeon-v9-android-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: "3.10"
   JAVA_VERSION: "17"
+  BUILDOZER_VERSION: "1.5.0"
+  CYTHON_VERSION: "0.29.37"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  PYTHONUNBUFFERED: "1"
+  BUILDOZER_WARN_ON_ROOT: "0"
 
 jobs:
-  build:
+  validar-y-compilar:
+    name: Validar proyecto y generar APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
-    runs-on: ubuntu-24.04
-
-    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
 
     steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Localizar proyecto AEON
+        run: |
+          set -Eeuo pipefail
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
+          echo "=================================================="
+          echo "LOCALIZANDO BUILDOZER.SPEC"
+          echo "=================================================="
 
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: temurin
-        java-version: ${{ env.JAVA_VERSION }}
+          mapfile -t SPEC_FILES < <(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 6 \
+              -type f \
+              -name "buildozer.spec" \
+              -not -path "*/.buildozer/*" \
+              -not -path "*/.venv/*" \
+              -not -path "*/venv/*" \
+              -print
+          )
 
-    - name: Cache Buildozer
-      uses: actions/cache@v4
-      with:
-        path: |
-          .buildozer
-          ~/.buildozer
-          ~/.gradle
-        key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-        restore-keys: |
-          buildozer-${{ runner.os }}
+          if [ "${#SPEC_FILES[@]}" -eq 0 ]; then
+            echo "::error title=buildozer.spec ausente::No se encontró buildozer.spec en el repositorio."
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f | sort
+            exit 1
+          fi
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
+          if [ "${#SPEC_FILES[@]}" -gt 1 ]; then
+            echo "::error title=Proyectos duplicados::Se encontraron varios archivos buildozer.spec."
+            printf '%s\n' "${SPEC_FILES[@]}"
+            echo "Debe existir una sola versión principal del proyecto."
+            exit 1
+          fi
 
-        sudo apt-get install -y \
-          zip \
-          unzip \
-          git \
-          build-essential \
-          autoconf \
-          automake \
-          libtool \
-          pkg-config \
-          zlib1g-dev \
-          libncurses5-dev \
-          libncursesw5-dev \
-          libtinfo6 \
-          cmake \
-          ninja-build \
-          libffi-dev \
-          libssl-dev
+          SPEC_PATH="${SPEC_FILES[0]}"
+          BUILD_DIR="$(dirname "$SPEC_PATH")"
 
-        python -m pip install --upgrade pip wheel setuptools
+          echo "SPEC_PATH=$SPEC_PATH" >> "$GITHUB_ENV"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
 
-        pip install \
-          cython==0.29.36 \
-          buildozer==1.5.0
+          echo "Proyecto detectado: $BUILD_DIR"
 
-    - name: Validate project
-      run: |
+          REQUIRED_FILES=(
+            "buildozer.spec"
+            "main.py"
+            "mobile_app.py"
+            "android_bootstrap_app.py"
+            "android_runtime_guard.py"
+            "apk_preflight.py"
+            "requirements-android.txt"
+          )
 
-        test -f main.py
+          HAS_ERROR=0
 
-        test -f buildozer.spec
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ -f "$BUILD_DIR/$file" ]; then
+              echo "OK: $file"
+            else
+              echo "::error title=Archivo obligatorio ausente::$file no está junto a buildozer.spec."
+              HAS_ERROR=1
+            fi
+          done
 
-        python -m py_compile main.py
+          if [ "$HAS_ERROR" -ne 0 ]; then
+            echo "Contenido encontrado:"
+            find "$BUILD_DIR" -maxdepth 3 -type f | sort
+            exit 1
+          fi
 
-    - name: Clean previous build
-      run: |
+      - name: Mostrar recursos iniciales
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          echo "CPU:"
+          nproc
+          echo "Memoria:"
+          free -h
+          echo "Disco:"
+          df -h
 
-        rm -rf .buildozer
+      - name: Liberar espacio del runner
+        run: |
+          set -Eeuo pipefail
 
-        rm -rf bin
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/21.* || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/22.* || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/23.* || true
+          sudo apt-get clean || true
 
-    - name: Build APK
-      run: |
+          echo "Espacio después de la limpieza:"
+          df -h
 
-        buildozer android debug
+      - name: Preparar swap de respaldo de forma segura
+        run: |
+          set -Eeuo pipefail
 
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: AEON-V9.2.0-APK
-        path: |
-          bin/*.apk
+          echo "Swap actual:"
+          swapon --show || true
 
-    - name: Upload Build Logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: Build-Logs
-        path: |
-          .buildozer/**/*.log
-          .buildozer/logs/**
+          CURRENT_SWAP_KB="$(free -k | awk '/^Swap:/ {print $2}')"
+          AVAILABLE_KB="$(df --output=avail / | tail -n 1 | tr -d ' ')"
+          SWAP_FILE="/swapfile-aeon-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          if [ "${CURRENT_SWAP_KB:-0}" -ge 1048576 ]; then
+            echo "El runner ya tiene al menos 1 GB de swap. Se reutiliza sin modificarlo."
+          elif [ "$AVAILABLE_KB" -le 8000000 ]; then
+            echo "No se crea swap adicional para preservar espacio en disco."
+          else
+            echo "Creando swap adicional en $SWAP_FILE"
+            if sudo fallocate -l 2G "$SWAP_FILE" 2>/dev/null || \
+               sudo dd if=/dev/zero of="$SWAP_FILE" bs=1M count=2048 status=progress; then
+              sudo chmod 600 "$SWAP_FILE"
+              sudo mkswap "$SWAP_FILE"
+              sudo swapon "$SWAP_FILE"
+              echo "AEON_SWAP_FILE=$SWAP_FILE" >> "$GITHUB_ENV"
+              echo "Swap adicional de 2 GB activado."
+            else
+              echo "::warning title=Swap no creado::La compilación continuará con la memoria disponible."
+              sudo rm -f "$SWAP_FILE" || true
+            fi
+          fi
+
+          free -h
+          df -h
+          swapon --show || true
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Verificar versiones
+        run: |
+          set -Eeuo pipefail
+
+          python --version
+          pip --version
+          java -version
+          javac -version
+
+          if [ -z "${JAVA_HOME:-}" ]; then
+            echo "::error title=JAVA_HOME ausente::Java no fue configurado correctamente."
+            exit 1
+          fi
+
+          echo "JAVA_HOME=$JAVA_HOME"
+
+      - name: Instalar herramientas del sistema
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git \
+            zip \
+            unzip \
+            curl \
+            wget \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            cmake \
+            ninja-build \
+            ccache \
+            gettext \
+            patch \
+            libffi-dev \
+            libssl-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev \
+            libsqlite3-dev \
+            libreadline-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libtinfo6 \
+            libjpeg-dev \
+            libpng-dev \
+            libfreetype6-dev
+
+          gcc --version | head -n 1
+          cmake --version | head -n 1
+          ccache --version | head -n 1
+
+      - name: Crear entorno virtual
+        run: |
+          set -Eeuo pipefail
+
+          python -m venv "$GITHUB_WORKSPACE/.venv-build"
+          source "$GITHUB_WORKSPACE/.venv-build/bin/activate"
+
+          python -m pip install --upgrade \
+            "pip<26" \
+            setuptools \
+            wheel
+
+          python -m pip install \
+            "buildozer==${BUILDOZER_VERSION}" \
+            "Cython==${CYTHON_VERSION}" \
+            pytest \
+            requests \
+            tenacity \
+            websockets \
+            plyer
+
+          python --version
+          buildozer --version
+          cython --version
+          pytest --version
+
+      - name: Ejecutar preflight Android
+        run: |
+          set -Eeuo pipefail
+
+          source "$GITHUB_WORKSPACE/.venv-build/bin/activate"
+          cd "$BUILD_DIR"
+
+          python apk_preflight.py
+
+      - name: Validar sintaxis Python
+        run: |
+          set -Eeuo pipefail
+
+          source "$GITHUB_WORKSPACE/.venv-build/bin/activate"
+          cd "$BUILD_DIR"
+
+          python -m compileall \
+            -q \
+            -x '(^|/)(\.git|\.buildozer|\.venv|venv|__pycache__|\.pytest_cache)(/|$)' \
+            .
+
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+
+          required = (
+              "main.py",
+              "mobile_app.py",
+              "android_bootstrap_app.py",
+              "android_runtime_guard.py",
+              "apk_preflight.py",
+          )
+
+          for filename in required:
+              path = Path(filename)
+              source = path.read_text(encoding="utf-8")
+              ast.parse(source, filename=filename)
+              print(f"AST OK: {filename}")
+          PY
+
+      - name: Validar buildozer.spec
+        run: |
+          set -Eeuo pipefail
+
+          cd "$BUILD_DIR"
+
+          grep -E \
+            "^(title|package\.name|package\.domain|source\.dir|version|requirements|orientation|fullscreen|android\.permissions|android\.api|android\.minapi|android\.ndk_api|android\.archs)" \
+            buildozer.spec || true
+
+          grep -q '^requirements = .*kivy' buildozer.spec || {
+            echo "::error title=Kivy ausente::buildozer.spec no incluye Kivy en requirements."
+            exit 1
+          }
+
+          grep -q '^android.archs = arm64-v8a' buildozer.spec || {
+            echo "::warning title=Arquitectura distinta::Se esperaba arm64-v8a."
+          }
+
+      - name: Ejecutar pruebas compatibles con Android
+        run: |
+          set -Eeuo pipefail
+
+          source "$GITHUB_WORKSPACE/.venv-build/bin/activate"
+          cd "$BUILD_DIR"
+
+          TEST_CANDIDATES=(
+            "test_android_startup_safety.py"
+            "test_runtime_stability.py"
+            "test_v8_guardrails_performance.py"
+          )
+
+          TESTS=()
+
+          for test_file in "${TEST_CANDIDATES[@]}"; do
+            if [ -f "$test_file" ]; then
+              TESTS+=("$test_file")
+            fi
+          done
+
+          if [ "${#TESTS[@]}" -eq 0 ]; then
+            echo "::warning title=Sin pruebas Android::No se encontraron pruebas Android compatibles."
+            exit 0
+          fi
+
+          printf ' - %s\n' "${TESTS[@]}"
+
+          pytest \
+            -q \
+            "${TESTS[@]}" \
+            --disable-warnings \
+            --maxfail=1
+
+      - name: Restaurar caché
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.buildozer
+            ~/.ccache
+          key: aeon-v9-${{ runner.os }}-py310-java17-${{ hashFiles('**/buildozer.spec', '**/requirements-android.txt', '**/android_bootstrap_app.py', '**/android_runtime_guard.py', '.github/workflows/build-apk.yml') }}
+          restore-keys: |
+            aeon-v9-${{ runner.os }}-py310-java17-
+
+      - name: Configurar Gradle y ccache
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "$HOME/.gradle"
+          mkdir -p "$HOME/.ccache"
+
+          cat > "$HOME/.gradle/gradle.properties" <<EOF
+          org.gradle.java.home=$JAVA_HOME
+          org.gradle.daemon=false
+          org.gradle.parallel=false
+          org.gradle.workers.max=2
+          org.gradle.caching=true
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          ccache --set-config=max_size=2G
+          ccache --set-config=compression=true
+          ccache --zero-stats
+
+          cat "$HOME/.gradle/gradle.properties"
+
+      - name: Iniciar vigilancia de recursos
+        run: |
+          set -Eeuo pipefail
+
+          (
+            while true; do
+              echo "=================================================="
+              echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+              echo "MEMORIA"
+              free -h
+              echo "DISCO"
+              df -h
+              echo "PROCESOS CON MAYOR MEMORIA"
+              ps -eo pid,ppid,%mem,%cpu,cmd --sort=-%mem | head -15
+              sleep 60
+            done
+          ) > "$GITHUB_WORKSPACE/resource-monitor.log" 2>&1 &
+
+          echo "$!" > "$GITHUB_WORKSPACE/resource-monitor.pid"
+
+      - name: Compilar APK debug
+        env:
+          USE_CCACHE: "1"
+          MAKEFLAGS: "-j2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+          GRADLE_OPTS: >-
+            -Dorg.gradle.daemon=false
+            -Dorg.gradle.parallel=false
+            -Dorg.gradle.workers.max=2
+            -Dfile.encoding=UTF-8
+        run: |
+          set -Eeuo pipefail
+          set -o pipefail
+
+          source "$GITHUB_WORKSPACE/.venv-build/bin/activate"
+          cd "$BUILD_DIR"
+
+          export PATH="$JAVA_HOME/bin:$PATH"
+          export GRADLE_OPTS="$GRADLE_OPTS -Dorg.gradle.java.home=$JAVA_HOME"
+          export MAKEFLAGS="-j2"
+          export CMAKE_BUILD_PARALLEL_LEVEL=2
+          export NINJAFLAGS="-j2"
+
+          echo "=================================================="
+          echo "COMPILANDO AEON V9 PROFESSIONAL"
+          echo "=================================================="
+          echo "Directorio: $(pwd)"
+          echo "JAVA_HOME: $JAVA_HOME"
+
+          java -version
+          free -h
+          df -h
+
+          rm -rf \
+            .buildozer/android/platform/build-*/build/python-installs \
+            2>/dev/null || true
+
+          find .buildozer \
+            -path "*/build/other_builds/*/requirements.txt" \
+            -delete 2>/dev/null || true
+
+          buildozer -v android debug 2>&1 | tee buildozer-full.log
+
+      - name: Detener vigilancia de recursos
+        if: always()
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/resource-monitor.pid" ]; then
+            kill "$(cat "$GITHUB_WORKSPACE/resource-monitor.pid")" \
+              2>/dev/null || true
+          fi
+
+      - name: Localizar y validar APK
+        run: |
+          set -Eeuo pipefail
+
+          APK_PATH="$(
+            find "$BUILD_DIR/bin" \
+              -maxdepth 2 \
+              -type f \
+              -name "*.apk" \
+              -printf '%T@ %p\n' \
+              2>/dev/null \
+              | sort -nr \
+              | head -n 1 \
+              | cut -d' ' -f2-
+          )"
+
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "::error title=APK no encontrado::Buildozer terminó sin producir un APK."
+            find "$BUILD_DIR/bin" -maxdepth 3 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          APK_SIZE="$(stat -c%s "$APK_PATH")"
+
+          if [ "$APK_SIZE" -lt 1000000 ]; then
+            echo "::error title=APK sospechosamente pequeño::Tamaño: $APK_SIZE bytes."
+            exit 1
+          fi
+
+          FINAL_APK="$GITHUB_WORKSPACE/AEON-Market-Quant-Terminal-V9-debug.apk"
+
+          cp "$APK_PATH" "$FINAL_APK"
+
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "FINAL_APK=$FINAL_APK" >> "$GITHUB_ENV"
+
+          ls -lh "$APK_PATH"
+          ls -lh "$FINAL_APK"
+
+          sha256sum "$FINAL_APK" | tee "$GITHUB_WORKSPACE/AEON-APK-SHA256.txt"
+
+      - name: Verificar integridad del APK
+        run: |
+          set -Eeuo pipefail
+
+          unzip -t "$FINAL_APK" > "$GITHUB_WORKSPACE/apk-integrity.log"
+
+          echo "Integridad ZIP correcta."
+          tail -n 10 "$GITHUB_WORKSPACE/apk-integrity.log"
+
+      - name: Liberar swap adicional
+        if: always()
+        run: |
+          if [ -n "${AEON_SWAP_FILE:-}" ] && [ -f "$AEON_SWAP_FILE" ]; then
+            sudo swapoff "$AEON_SWAP_FILE" 2>/dev/null || true
+            sudo rm -f "$AEON_SWAP_FILE" || true
+          fi
+
+      - name: Guardar estadísticas ccache
+        if: always()
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats \
+              > "$GITHUB_WORKSPACE/ccache-stats.txt" || true
+            cat "$GITHUB_WORKSPACE/ccache-stats.txt" || true
+          else
+            echo "ccache no llegó a instalarse." \
+              > "$GITHUB_WORKSPACE/ccache-stats.txt"
+          fi
+
+      - name: Preparar diagnóstico
+        if: always()
+        run: |
+          set +e
+
+          DIAGNOSTIC_DIR="$GITHUB_WORKSPACE/aeon-build-diagnostics"
+          mkdir -p "$DIAGNOSTIC_DIR"
+
+          {
+            echo "AEON V9 PROFESSIONAL - BUILD DIAGNOSTICS"
+            echo "========================================"
+            echo "Fecha UTC: $(date -u)"
+            echo "Repositorio: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_RUN_NUMBER"
+            echo "BUILD_DIR: ${BUILD_DIR:-no detectado}"
+            echo "Python:"
+            python --version 2>&1
+            echo "Java:"
+            java -version 2>&1
+            echo "Disco:"
+            df -h
+            echo "Memoria:"
+            free -h
+          } > "$DIAGNOSTIC_DIR/system-info.txt"
+
+          if [ -n "${BUILD_DIR:-}" ]; then
+            cp "$BUILD_DIR/buildozer.spec" \
+              "$DIAGNOSTIC_DIR/buildozer.spec" 2>/dev/null || true
+
+            cp "$BUILD_DIR/buildozer-full.log" \
+              "$DIAGNOSTIC_DIR/buildozer-full.log" 2>/dev/null || true
+
+            find "$BUILD_DIR/.buildozer" \
+              -type f \
+              \( -name "*.log" -o -name "build.log" \) \
+              -exec cp --parents {} "$DIAGNOSTIC_DIR" \; \
+              2>/dev/null || true
+
+            find "$BUILD_DIR/bin" \
+              -maxdepth 3 \
+              -type f \
+              -print \
+              > "$DIAGNOSTIC_DIR/generated-files.txt" \
+              2>/dev/null || true
+          fi
+
+          cp "$GITHUB_WORKSPACE/ccache-stats.txt" \
+            "$DIAGNOSTIC_DIR/" 2>/dev/null || true
+
+          cp "$GITHUB_WORKSPACE/apk-integrity.log" \
+            "$DIAGNOSTIC_DIR/" 2>/dev/null || true
+
+          cp "$GITHUB_WORKSPACE/AEON-APK-SHA256.txt" \
+            "$DIAGNOSTIC_DIR/" 2>/dev/null || true
+
+          cp "$GITHUB_WORKSPACE/resource-monitor.log" \
+            "$DIAGNOSTIC_DIR/" 2>/dev/null || true
+
+          echo "Últimas 200 líneas del log:"
+          tail -n 200 "$BUILD_DIR/buildozer-full.log" 2>/dev/null || true
+
+      - name: Subir APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEON-V9-Android-Debug-${{ github.run_number }}
+          path: |
+            ${{ env.FINAL_APK }}
+            AEON-APK-SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+      - name: Subir registros
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEON-V9-Build-Logs-${{ github.run_number }}
+          path: aeon-build-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
+          overwrite: true
